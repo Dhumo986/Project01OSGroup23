@@ -21,6 +21,9 @@ int is_builtin(char **args);
 void execute_builtin(char **args);
 void execute_external(char **args);
 void print_prompt();
+int has_pipe(char *input);
+void execute_piped_commands(char *input);
+void execute_single_pipeline(char **commands, int num_commands);
 
 // Signal handler for Ctrl+C
 void sigint_handler(int sig) {
@@ -57,86 +60,8 @@ void print_prompt() {
   }
 }
 
-int main() {
-  char input[MAX_INPUT];
-  char *args[MAX_ARGS];
-  char last_command[MAX_INPUT] = "";
-  int command_count = 0;
-
-  // Install signal handler for Ctrl+C
-  signal(SIGINT, sigint_handler);
-
-  // Welcome message
-  printf("\n");
-  printf("╔════════════════════════════════════════════╗\n");
-  printf("║       Welcome to MyShell Enhanced!         ║\n");
-  printf("║                                            ║\n");
-  printf("║  Type 'help' for available commands       ║\n");
-  printf("║  Press Ctrl+C to cancel current line      ║\n");
-  printf("║  Press Ctrl+D or type 'exit' to quit      ║\n");
-  printf("╚════════════════════════════════════════════╝\n");
-  printf("\n");
-
-  // Main shell loop
-  while (1) {
-    // Print fancy prompt
-    print_prompt();
-    fflush(stdout);
-
-    // Read user input
-    if (fgets(input, MAX_INPUT, stdin) == NULL) {
-      printf("\n");
-      break; // EOF (Ctrl+D)
-    }
-
-    // Remove trailing newline
-    input[strcspn(input, "\n")] = '\0';
-
-    // Handle !! (repeat last command)
-    if (strcmp(input, "!!") == 0) {
-      if (strlen(last_command) == 0) {
-        printf(COLOR_YELLOW "myshell: no previous command" COLOR_RESET "\n");
-        continue;
-      }
-      strcpy(input, last_command);
-      printf(COLOR_BLUE "Repeating: %s" COLOR_RESET "\n", input);
-    } else if (strlen(input) > 0) {
-      // Save non-empty command as last command
-      strcpy(last_command, input);
-    }
-
-    // Skip empty commands
-    if (strlen(input) == 0) {
-      continue;
-    }
-
-    // Increment command counter
-    command_count++;
-
-    // Parse the command
-    parse_command(input, args);
-
-    // Skip if no command entered
-    if (args[0] == NULL) {
-      continue;
-    }
-
-    // Check if it's a built-in command
-    if (is_builtin(args)) {
-      execute_builtin(args);
-    } else {
-      // Execute external command
-      execute_external(args);
-    }
-  }
-
-  printf("\n");
-  printf(COLOR_GREEN "Thanks for using MyShell!" COLOR_RESET "\n");
-  printf("You executed %d command(s) in this session.\n", command_count);
-  printf("Goodbye! 👋\n\n");
-
-  return 0;
-}
+// Check if command contains pipe
+int has_pipe(char *input) { return (strchr(input, '|') != NULL); }
 
 // Parse input string into array of arguments
 void parse_command(char *input, char **args) {
@@ -153,6 +78,110 @@ void parse_command(char *input, char **args) {
   }
 
   args[i] = NULL; // NULL-terminate the array
+}
+
+// Execute commands connected by pipes
+void execute_piped_commands(char *input) {
+  char *commands[MAX_ARGS];
+  int num_commands = 0;
+  char input_copy[MAX_INPUT];
+
+  // Make a copy since strtok modifies the string
+  strcpy(input_copy, input);
+
+  // Split by pipe symbol
+  char *token = strtok(input_copy, "|");
+  while (token != NULL && num_commands < MAX_ARGS - 1) {
+    // Trim leading spaces
+    while (*token == ' ' || *token == '\t')
+      token++;
+    commands[num_commands] = token;
+    num_commands++;
+    token = strtok(NULL, "|");
+  }
+
+  if (num_commands == 0) {
+    return;
+  }
+
+  // Execute the pipeline
+  execute_single_pipeline(commands, num_commands);
+}
+
+// Execute a pipeline of commands
+void execute_single_pipeline(char **commands, int num_commands) {
+  int pipes[num_commands - 1][2]; // Array of pipe pairs
+  pid_t pids[num_commands];       // Array of process IDs
+
+  // Create all pipes
+  for (int i = 0; i < num_commands - 1; i++) {
+    if (pipe(pipes[i]) < 0) {
+      perror("pipe");
+      return;
+    }
+  }
+
+  // Create a process for each command
+  for (int i = 0; i < num_commands; i++) {
+    pids[i] = fork();
+
+    if (pids[i] < 0) {
+      perror("fork");
+      return;
+    }
+
+    if (pids[i] == 0) {
+      // CHILD PROCESS
+
+      // Parse this command's arguments
+      char *args[MAX_ARGS];
+      char cmd_copy[MAX_INPUT];
+      strcpy(cmd_copy, commands[i]);
+      parse_command(cmd_copy, args);
+
+      if (args[0] == NULL) {
+        exit(1);
+      }
+
+      // Redirect input from previous pipe (if not first command)
+      if (i > 0) {
+        dup2(pipes[i - 1][0], STDIN_FILENO);
+      }
+
+      // Redirect output to next pipe (if not last command)
+      if (i < num_commands - 1) {
+        dup2(pipes[i][1], STDOUT_FILENO);
+      }
+
+      // Close all pipe file descriptors in child
+      for (int j = 0; j < num_commands - 1; j++) {
+        close(pipes[j][0]);
+        close(pipes[j][1]);
+      }
+
+      // Execute the command
+      if (execvp(args[0], args) < 0) {
+        fprintf(stderr,
+                COLOR_RED "myshell: command not found: %s" COLOR_RESET "\n",
+                args[0]);
+        exit(127);
+      }
+    }
+  }
+
+  // PARENT PROCESS
+
+  // Close all pipes in parent
+  for (int i = 0; i < num_commands - 1; i++) {
+    close(pipes[i][0]);
+    close(pipes[i][1]);
+  }
+
+  // Wait for all children to finish
+  for (int i = 0; i < num_commands; i++) {
+    int status;
+    waitpid(pids[i], &status, 0);
+  }
 }
 
 // Check if command is a built-in
@@ -266,15 +295,16 @@ void execute_builtin(char **args) {
     printf("  Ctrl+C         Cancel current input (doesn't exit shell)\n");
     printf("  Ctrl+D         Exit the shell\n");
     printf("\n");
+    printf(COLOR_BLUE "Piping:" COLOR_RESET "\n");
+    printf("  cmd1 | cmd2    Connect output of cmd1 to input of cmd2\n");
+    printf("  Examples:\n");
+    printf("    ls | grep txt       - List files containing 'txt'\n");
+    printf("    cat file | wc -l    - Count lines in file\n");
+    printf("    ps aux | grep user  - Find processes by user\n");
+    printf("\n");
     printf(COLOR_BLUE "External Commands:" COLOR_RESET "\n");
     printf("  You can run any system command like:\n");
     printf("  ls, cat, grep, date, whoami, etc.\n");
-    printf("\n");
-    printf(COLOR_BLUE "Examples:" COLOR_RESET "\n");
-    printf("  ls -la         List all files with details\n");
-    printf("  echo Hello     Print 'Hello' to screen\n");
-    printf("  cd /tmp        Change to /tmp directory\n");
-    printf("  pwd            Show current directory\n");
     printf("\n");
     printf("═══════════════════════════════════════════════════════════\n");
     printf("\n");
@@ -328,4 +358,91 @@ void execute_external(char **args) {
              signal_num);
     }
   }
+}
+
+int main() {
+  char input[MAX_INPUT];
+  char *args[MAX_ARGS];
+  char last_command[MAX_INPUT] = "";
+  int command_count = 0;
+
+  // Install signal handler for Ctrl+C
+  signal(SIGINT, sigint_handler);
+
+  // Welcome message
+  printf("\n");
+  printf("╔════════════════════════════════════════════╗\n");
+  printf("║    Welcome to MyShell Enhanced + Pipes!   ║\n");
+  printf("║                                            ║\n");
+  printf("║  Type 'help' for available commands       ║\n");
+  printf("║  Piping is now supported!                 ║\n");
+  printf("║  Example: ls | grep txt                   ║\n");
+  printf("╚════════════════════════════════════════════╝\n");
+  printf("\n");
+
+  // Main shell loop
+  while (1) {
+    // Print fancy prompt
+    print_prompt();
+    fflush(stdout);
+
+    // Read user input
+    if (fgets(input, MAX_INPUT, stdin) == NULL) {
+      printf("\n");
+      break; // EOF (Ctrl+D)
+    }
+
+    // Remove trailing newline
+    input[strcspn(input, "\n")] = '\0';
+
+    // Handle !! (repeat last command)
+    if (strcmp(input, "!!") == 0) {
+      if (strlen(last_command) == 0) {
+        printf(COLOR_YELLOW "myshell: no previous command" COLOR_RESET "\n");
+        continue;
+      }
+      strcpy(input, last_command);
+      printf(COLOR_BLUE "Repeating: %s" COLOR_RESET "\n", input);
+    } else if (strlen(input) > 0) {
+      // Save non-empty command as last command
+      strcpy(last_command, input);
+    }
+
+    // Skip empty commands
+    if (strlen(input) == 0) {
+      continue;
+    }
+
+    // Increment command counter
+    command_count++;
+
+    // Check if command has pipes
+    if (has_pipe(input)) {
+      // Handle piped commands
+      execute_piped_commands(input);
+    } else {
+      // Handle regular commands
+      parse_command(input, args);
+
+      // Skip if no command entered
+      if (args[0] == NULL) {
+        continue;
+      }
+
+      // Check if it's a built-in command
+      if (is_builtin(args)) {
+        execute_builtin(args);
+      } else {
+        // Execute external command
+        execute_external(args);
+      }
+    }
+  }
+
+  printf("\n");
+  printf(COLOR_GREEN "Thanks for using MyShell!" COLOR_RESET "\n");
+  printf("You executed %d command(s) in this session.\n", command_count);
+  printf("Goodbye! 👋\n\n");
+
+  return 0;
 }
