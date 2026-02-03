@@ -15,6 +15,19 @@
 #define COLOR_YELLOW "\033[1;33m"
 #define COLOR_RESET "\033[0m"
 
+// Background job tracking
+#define MAX_JOBS 100
+
+typedef struct {
+  pid_t pid;
+  int job_id;
+  char command[MAX_INPUT];
+  int completed;
+} Job;
+
+Job jobs[MAX_JOBS];
+int job_count = 0;
+
 // Function prototypes
 void parse_command(char *input, char **args);
 int is_builtin(char **args);
@@ -24,12 +37,59 @@ void print_prompt();
 int has_pipe(char *input);
 void execute_piped_commands(char *input);
 void execute_single_pipeline(char **commands, int num_commands);
+void execute_external_background(char **args, int background,
+                                 char *original_cmd);
+int is_background_command(char *input);
+void remove_background_symbol(char *input);
 
 // Signal handler for Ctrl+C
 void sigint_handler(int sig) {
   printf("\n");
   print_prompt();
   fflush(stdout);
+}
+
+// Signal handler for child process termination
+void sigchld_handler(int sig) {
+  pid_t pid;
+  int status;
+
+  // Reap all terminated child processes
+  while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+    // Find and mark job as completed
+    for (int i = 0; i < job_count; i++) {
+      if (jobs[i].pid == pid && !jobs[i].completed) {
+        jobs[i].completed = 1;
+        printf("\n[%d]+ Done                    %s\n", jobs[i].job_id,
+               jobs[i].command);
+        print_prompt();
+        fflush(stdout);
+        break;
+      }
+    }
+  }
+}
+
+// Check if command should run in background
+int is_background_command(char *input) {
+  int len = strlen(input);
+  if (len > 0 && input[len - 1] == '&') {
+    return 1;
+  }
+  return 0;
+}
+
+// Remove & from command
+void remove_background_symbol(char *input) {
+  int len = strlen(input);
+  if (len > 0 && input[len - 1] == '&') {
+    input[len - 1] = '\0';
+    // Remove trailing spaces
+    while (len > 0 && (input[len - 1] == ' ' || input[len - 1] == '\t')) {
+      input[len - 1] = '\0';
+      len--;
+    }
+  }
 }
 
 // Print colorful prompt with current directory
@@ -198,6 +258,8 @@ int is_builtin(char **args) {
     return 1;
   if (strcmp(args[0], "clear") == 0)
     return 1;
+  if (strcmp(args[0], "jobs") == 0)
+    return 1;
 
   return 0;
 }
@@ -287,6 +349,7 @@ void execute_builtin(char **args) {
     printf("  pwd            Print current working directory\n");
     printf("  echo [text]    Print text to screen\n");
     printf("  clear          Clear the screen\n");
+    printf("  jobs           List background jobs\n");
     printf("  help           Show this help message\n");
     printf("  exit           Exit the shell\n");
     printf("\n");
@@ -302,12 +365,34 @@ void execute_builtin(char **args) {
     printf("    cat file | wc -l    - Count lines in file\n");
     printf("    ps aux | grep user  - Find processes by user\n");
     printf("\n");
+    printf(COLOR_BLUE "Background Processing:" COLOR_RESET "\n");
+    printf("  command &      Run command in background\n");
+    printf("  Examples:\n");
+    printf("    sleep 10 &         - Sleep for 10 seconds in background\n");
+    printf("    long_task &        - Run long task without blocking shell\n");
+    printf("    jobs               - List running background jobs\n");
+    printf("\n");
     printf(COLOR_BLUE "External Commands:" COLOR_RESET "\n");
     printf("  You can run any system command like:\n");
     printf("  ls, cat, grep, date, whoami, etc.\n");
     printf("\n");
     printf("═══════════════════════════════════════════════════════════\n");
     printf("\n");
+    return;
+  }
+  // jobs command
+  if (strcmp(args[0], "jobs") == 0) {
+    int active_jobs = 0;
+    for (int i = 0; i < job_count; i++) {
+      if (!jobs[i].completed) {
+        printf("[%d]  Running                 %s &\n", jobs[i].job_id,
+               jobs[i].command);
+        active_jobs++;
+      }
+    }
+    if (active_jobs == 0) {
+      printf("No background jobs.\n");
+    }
     return;
   }
 
@@ -360,6 +445,58 @@ void execute_external(char **args) {
   }
 }
 
+// Execute external commands with background support
+void execute_external_background(char **args, int background,
+                                 char *original_cmd) {
+  pid_t pid = fork();
+
+  if (pid < 0) {
+    perror("fork");
+    return;
+  }
+
+  if (pid == 0) {
+    // Child process
+    if (execvp(args[0], args) < 0) {
+      fprintf(stderr,
+              COLOR_RED "myshell: command not found: %s" COLOR_RESET "\n",
+              args[0]);
+      exit(127);
+    }
+  } else {
+    // Parent process
+    if (background) {
+      // Background process - don't wait
+      if (job_count < MAX_JOBS) {
+        jobs[job_count].pid = pid;
+        jobs[job_count].job_id = job_count + 1;
+        strncpy(jobs[job_count].command, original_cmd, MAX_INPUT - 1);
+        jobs[job_count].completed = 0;
+
+        printf("[%d] %d\n", jobs[job_count].job_id, pid);
+        job_count++;
+      }
+    } else {
+      // Foreground process - wait for completion
+      int status;
+      waitpid(pid, &status, 0);
+
+      // Check exit status
+      if (WIFEXITED(status)) {
+        int exit_code = WEXITSTATUS(status);
+        if (exit_code != 0) {
+          printf(COLOR_YELLOW "[Process exited with code %d]" COLOR_RESET "\n",
+                 exit_code);
+        }
+      } else if (WIFSIGNALED(status)) {
+        int signal_num = WTERMSIG(status);
+        printf(COLOR_RED "[Process terminated by signal %d]" COLOR_RESET "\n",
+               signal_num);
+      }
+    }
+  }
+}
+
 int main() {
   char input[MAX_INPUT];
   char *args[MAX_ARGS];
@@ -368,15 +505,16 @@ int main() {
 
   // Install signal handler for Ctrl+C
   signal(SIGINT, sigint_handler);
+  signal(SIGCHLD, sigchld_handler);
 
   // Welcome message
   printf("\n");
   printf("╔════════════════════════════════════════════╗\n");
-  printf("║    Welcome to MyShell Enhanced + Pipes!   ║\n");
+  printf("║    Welcome to MyShell Enhanced + Pipes!    ║\n");
   printf("║                                            ║\n");
-  printf("║  Type 'help' for available commands       ║\n");
-  printf("║  Piping is now supported!                 ║\n");
-  printf("║  Example: ls | grep txt                   ║\n");
+  printf("║  Type 'help' for available commands        ║\n");
+  printf("║  Piping & Background jobs supported!       ║\n");
+  printf("║  Example: ls | grep txt                    ║\n");
   printf("╚════════════════════════════════════════════╝\n");
   printf("\n");
 
@@ -415,26 +553,40 @@ int main() {
 
     // Increment command counter
     command_count++;
+    // Check for background command
+    int background = is_background_command(input);
+    char original_cmd[MAX_INPUT];
+    strcpy(original_cmd, input);
+
+    if (background) {
+      remove_background_symbol(input);
+    }
 
     // Check if command has pipes
     if (has_pipe(input)) {
       // Handle piped commands
+      if (background) {
+        printf(COLOR_YELLOW
+               "Warning: Background piping not supported\n" COLOR_RESET);
+      }
       execute_piped_commands(input);
     } else {
       // Handle regular commands
       parse_command(input, args);
 
-      // Skip if no command entered
       if (args[0] == NULL) {
         continue;
       }
 
-      // Check if it's a built-in command
       if (is_builtin(args)) {
+        if (background) {
+          printf(COLOR_YELLOW "Warning: Cannot run built-in commands in "
+                              "background\n" COLOR_RESET);
+        }
         execute_builtin(args);
       } else {
-        // Execute external command
-        execute_external(args);
+        // Use new function with background support
+        execute_external_background(args, background, original_cmd);
       }
     }
   }
