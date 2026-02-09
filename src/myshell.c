@@ -4,6 +4,7 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #define MAX_INPUT 1024
 #define MAX_ARGS 64
@@ -41,6 +42,10 @@ void execute_external_background(char **args, int background,
                                  char *original_cmd);
 int is_background_command(char *input);
 void remove_background_symbol(char *input);
+char* search_in_path(const char *command);
+void expand_args(char **args);
+int has_redirection(char *input);
+void execute_with_redirection(char **args, char *input);
 
 // Signal handler for Ctrl+C
 void sigint_handler(int sig) {
@@ -112,16 +117,114 @@ void print_prompt() {
   char *home = getenv("HOME");
   if (home != NULL && strncmp(cwd, home, strlen(home)) == 0) {
     printf(COLOR_GREEN "%s@%s" COLOR_RESET ":" COLOR_BLUE "~%s" COLOR_RESET
-                       "$ ",
+                       "> ",
            username ? username : "user", hostname, cwd + strlen(home));
   } else {
-    printf(COLOR_GREEN "%s@%s" COLOR_RESET ":" COLOR_BLUE "%s" COLOR_RESET "$ ",
+    printf(COLOR_GREEN "%s@%s" COLOR_RESET ":" COLOR_BLUE "%s" COLOR_RESET "> ",
            username ? username : "user", hostname, cwd);
   }
 }
 
 // Check if command contains pipe
 int has_pipe(char *input) { return (strchr(input, '|') != NULL); }
+
+// Check if command has redirection
+int has_redirection(char *input) {
+    return (strchr(input, '>') != NULL || strchr(input, '<') != NULL);
+}
+// Execute command with I/O redirection
+void execute_with_redirection(char **args, char *input) {
+    char *input_file = NULL;
+    char *output_file = NULL;
+    char input_copy[MAX_INPUT];
+    strcpy(input_copy, input);
+    
+    // Parse for < and >
+    char *in_redir = strchr(input_copy, '<');
+    char *out_redir = strchr(input_copy, '>');
+    
+    // Extract filenames
+    if (in_redir != NULL) {
+        *in_redir = '\0';
+        in_redir++;
+        while (*in_redir == ' ' || *in_redir == '\t') in_redir++;
+        
+        char *end = in_redir;
+        while (*end != '\0' && *end != ' ' && *end != '\t' && *end != '>' && *end != '<') end++;
+        *end = '\0';
+        input_file = in_redir;
+    }
+    
+    if (out_redir != NULL) {
+        *out_redir = '\0';
+        out_redir++;
+        while (*out_redir == ' ' || *out_redir == '\t') out_redir++;
+        
+        char *end = out_redir;
+        while (*end != '\0' && *end != ' ' && *end != '\t' && *end != '>' && *end != '<') end++;
+        *end = '\0';
+        output_file = out_redir;
+    }
+    
+    // Re-parse command without redirection symbols
+    char cmd_only[MAX_INPUT];
+    strcpy(cmd_only, input_copy);
+    char *clean_args[MAX_ARGS];
+    parse_command(cmd_only, clean_args);
+    expand_args(clean_args);
+    
+    if (clean_args[0] == NULL) {
+        return;
+    }
+    
+    pid_t pid = fork();
+    
+    if (pid < 0) {
+        perror("fork");
+        return;
+    }
+    
+    if (pid == 0) {
+        // Child process - handle redirections
+        
+        // Input redirection
+        if (input_file != NULL) {
+            int fd_in = open(input_file, O_RDONLY);
+            if (fd_in < 0) {
+                fprintf(stderr, COLOR_RED "myshell: cannot open %s: No such file or directory\n" COLOR_RESET, input_file);
+                exit(1);
+            }
+            dup2(fd_in, STDIN_FILENO);
+            close(fd_in);
+        }
+        
+        // Output redirection
+        if (output_file != NULL) {
+            int fd_out = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (fd_out < 0) {
+                perror("open output file");
+                exit(1);
+            }
+            dup2(fd_out, STDOUT_FILENO);
+            close(fd_out);
+        }
+        
+        // Execute command
+        char *cmd_path = search_in_path(clean_args[0]);
+        if (cmd_path == NULL) {
+            fprintf(stderr, COLOR_RED "myshell: command not found: %s" COLOR_RESET "\n", clean_args[0]);
+            exit(127);
+        }
+        
+        execv(cmd_path, clean_args);
+        perror("execv");
+        exit(127);
+    } else {
+        // Parent waits
+        int status;
+        waitpid(pid, &status, 0);
+    }
+}
 
 // Parse input string into array of arguments
 void parse_command(char *input, char **args) {
@@ -138,6 +241,37 @@ void parse_command(char *input, char **args) {
   }
 
   args[i] = NULL; // NULL-terminate the array
+}
+// Expand environment variables and tildes in arguments
+void expand_args(char **args) {
+    for (int i = 0; args[i] != NULL; i++) {
+        char expanded[MAX_INPUT];
+        char *arg = args[i];
+        
+        // Part 3: Tilde expansion
+        if (arg[0] == '~') {
+            char *home = getenv("HOME");
+            if (home != NULL) {
+                if (arg[1] == '\0') {
+                    // Just "~"
+                    strncpy(expanded, home, MAX_INPUT - 1);
+                    args[i] = strdup(expanded);
+                } else if (arg[1] == '/') {
+                    // "~/something"
+                    snprintf(expanded, MAX_INPUT, "%s%s", home, arg + 1);
+                    args[i] = strdup(expanded);
+                }
+            }
+        }
+        // Part 2: Environment variable expansion
+        else if (arg[0] == '$') {
+            char *var_name = arg + 1;  // Skip the $
+            char *value = getenv(var_name);
+            if (value != NULL) {
+                args[i] = strdup(value);
+            }
+        }
+    }
 }
 
 // Execute commands connected by pipes
@@ -419,11 +553,16 @@ void execute_external(char **args) {
 
   if (pid == 0) {
     // Child process
-    if (execvp(args[0], args) < 0) {
-      fprintf(stderr,
-              COLOR_RED "myshell: command not found: %s" COLOR_RESET "\n",
-              args[0]);
-      exit(127); // Standard exit code for command not found
+    char *cmd_path = search_in_path(args[0]);
+    
+    if (cmd_path == NULL) {
+      fprintf(stderr, COLOR_RED "myshell: command not found: %s" COLOR_RESET "\n", args[0]);
+      exit(127);
+    }
+    
+    if (execv(cmd_path, args) < 0) {
+      perror("execv");
+      exit(127);
     }
   } else {
     // Parent process
@@ -443,6 +582,37 @@ void execute_external(char **args) {
              signal_num);
     }
   }
+}
+// Search for command in PATH
+char* search_in_path(const char *command) {
+    // If command contains /, don't search PATH
+    if (strchr(command, '/') != NULL) {
+        return strdup(command);
+    }
+    
+    char *path_env = getenv("PATH");
+    if (path_env == NULL) {
+        return NULL;
+    }
+    
+    char path_copy[MAX_INPUT];
+    strncpy(path_copy, path_env, MAX_INPUT - 1);
+    
+    char *dir = strtok(path_copy, ":");
+    static char full_path[MAX_INPUT];
+    
+    while (dir != NULL) {
+        snprintf(full_path, MAX_INPUT, "%s/%s", dir, command);
+        
+        // Check if executable exists
+        if (access(full_path, X_OK) == 0) {
+            return full_path;
+        }
+        
+        dir = strtok(NULL, ":");
+    }
+    
+    return NULL;  // Command not found
 }
 
 // Execute external commands with background support
@@ -570,14 +740,23 @@ int main() {
                "Warning: Background piping not supported\n" COLOR_RESET);
       }
       execute_piped_commands(input);
+	} else if (has_redirection(input)) {
+            // Handle I/O redirection
+            if (background) {
+                printf(COLOR_YELLOW "Warning: Background redirection not fully supported\n" COLOR_RESET);
+            }
+            execute_with_redirection(NULL, input);
     } else {
       // Handle regular commands
       parse_command(input, args);
-
+      
+      // Expand environment variables and tildes
+      expand_args(args);
+    
       if (args[0] == NULL) {
         continue;
       }
-
+    
       if (is_builtin(args)) {
         if (background) {
           printf(COLOR_YELLOW "Warning: Cannot run built-in commands in "
@@ -590,11 +769,12 @@ int main() {
       }
     }
   }
-
+      
   printf("\n");
   printf(COLOR_GREEN "Thanks for using MyShell!" COLOR_RESET "\n");
-  printf("You executed %d command(s) in this session.\n", command_count);
+    printf("You executed %d command(s) in this session.\n", command_count);
   printf("Goodbye! 👋\n\n");
-
+  
   return 0;
 }
+
